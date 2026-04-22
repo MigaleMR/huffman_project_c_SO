@@ -4,13 +4,9 @@
 #include <stdint.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <errno.h>
-
-#ifdef _WIN32
-#include <windows.h>
-#else
 #include <time.h>
-#endif
 
 #include "huffman.h"
 
@@ -28,17 +24,11 @@ typedef struct {
 } FileList;
 
 typedef struct {
-  unsigned char *data;
-  size_t size;
-  size_t capacity;
+  FILE *file;
   unsigned char buffer;
   unsigned char bitCount;
-} MemoryBitWriter;
-
-typedef struct {
-  unsigned char *data;
-  uint64_t size;
-} CompressedFile;
+  uint64_t bytesWritten;
+} BitWriter;
 
 /*
 Function that allocates dynamic memory and verifies if the allocation was successful.
@@ -299,7 +289,7 @@ Output:
 */
 
 static void countFrequencies(FileList *list, uint32_t freq[ALPHABET_SIZE]) {
-  unsigned char buffer[4096];
+  unsigned char buffer[1024];
   size_t i;
 
   for (i = 0; i < ALPHABET_SIZE; i++) {
@@ -330,48 +320,45 @@ static void countFrequencies(FileList *list, uint32_t freq[ALPHABET_SIZE]) {
   }
 }
 
-static void memoryBitWriterInit(MemoryBitWriter *writer) {
-  writer->data = NULL;
-  writer->size = 0;
-  writer->capacity = 0;
-  writer->buffer = 0;
-  writer->bitCount = 0;
-}
+/*
+Function that calculates the compressed size of each file using the generated Huffman codes.
+Input:
+    - list: pointer to the file list structure.
+    - codes: array of pointers to the Huffman codes for each byte.
+Output:
+    - stores the compressed size in bytes for each file entry.
+*/
 
-static void memoryBitWriterAppendByte(MemoryBitWriter *writer, unsigned char value) {
-  if (writer->size == writer->capacity) {
-    size_t newCapacity = (writer->capacity == 0) ? 1024 : writer->capacity * 2;
-    writer->data = (unsigned char *)reallocateMemory(writer->data, newCapacity);
-    writer->capacity = newCapacity;
-  }
-
-  writer->data[writer->size++] = value;
-}
-
-static void memoryBitWriterWriteCode(MemoryBitWriter *writer, const char *code) {
+static void addCompressedSizes(FileList *list, char *codes[ALPHABET_SIZE]) {
+  unsigned char buffer[1024];
+  uint32_t codeLengths[ALPHABET_SIZE];
   size_t i;
 
-  for (i = 0; code[i] != '\0'; i++) {
-    writer->buffer = (unsigned char)(writer->buffer << 1);
-    if (code[i] == '1') {
-      writer->buffer |= 1u;
-    }
-    writer->bitCount++;
-
-    if (writer->bitCount == 8) {
-      memoryBitWriterAppendByte(writer, writer->buffer);
-      writer->buffer = 0;
-      writer->bitCount = 0;
-    }
+  for (i = 0; i < ALPHABET_SIZE; i++) {
+    codeLengths[i] = (codes[i] == NULL) ? 0u : (uint32_t)strlen(codes[i]);
   }
-}
 
-static void memoryBitWriterFlush(MemoryBitWriter *writer) {
-  if (writer->bitCount > 0) {
-    writer->buffer = (unsigned char)(writer->buffer << (8 - writer->bitCount));
-    memoryBitWriterAppendByte(writer, writer->buffer);
-    writer->buffer = 0;
-    writer->bitCount = 0;
+  for (i = 0; i < list->count; i++) {
+    FILE *input = fopen(list->items[i].fullPath, "rb");
+    uint64_t totalBits = 0;
+    size_t bytesRead;
+
+    if (input == NULL) {
+      fprintf(stderr,
+              "\033[41m\n----|ERROR: couldn't open '%s'.|----\033[0m\n\n",
+              list->items[i].fullPath);
+      exit(EXIT_FAILURE);
+    }
+
+    while ((bytesRead = fread(buffer, 1, sizeof(buffer), input)) > 0) {
+      size_t j;
+      for (j = 0; j < bytesRead; j++) {
+        totalBits += codeLengths[buffer[j]];
+      }
+    }
+
+    fclose(input);
+    list->items[i].compressedSize = (totalBits + 7u) / 8u;
   }
 }
 
@@ -415,13 +402,82 @@ static int writeU64(FILE *output, uint64_t value) {
   return fwrite(bytes, 1, 8, output) == 8;
 }
 
-static void compressFileToMemory(const FileEntry *file,
-                                 char *codes[ALPHABET_SIZE],
-                                 unsigned char **compressedData,
-                                 uint64_t *compressedSize) {
-  unsigned char buffer[4096];
+/*
+Function that initializes the bit writer structure used to write compressed data.
+Input:
+    - writer: pointer to the bit writer structure.
+    - file: pointer to the destination binary file.
+Output:
+    - sets the initial state of the bit writer.
+*/
+
+static void bitWriterInit(BitWriter *writer, FILE *file) {
+  writer->file = file;
+  writer->buffer = 0;
+  writer->bitCount = 0;
+  writer->bytesWritten = 0;
+}
+
+/*
+Function that writes the bits of one Huffman code into the output stream.
+Input:
+    - writer: pointer to the bit writer structure.
+    - code: pointer to the string that contains the Huffman code.
+Output:
+    - writes the code bit by bit into the output file buffer.
+*/
+
+static void bitWriterWriteCode(BitWriter *writer, const char *code) {
+  size_t i;
+
+  for (i = 0; code[i] != '\0'; i++) {
+    writer->buffer = (unsigned char)(writer->buffer << 1);
+    if (code[i] == '1') {
+      writer->buffer |= 1u;
+    }
+    writer->bitCount++;
+
+    if (writer->bitCount == 8) {
+      fputc(writer->buffer, writer->file);
+      writer->buffer = 0;
+      writer->bitCount = 0;
+      writer->bytesWritten++;
+    }
+  }
+}
+
+/*
+Function that writes the last incomplete byte to the output file if there are pending bits.
+Input:
+    - writer: pointer to the bit writer structure.
+Output:
+    - flushes the remaining buffered bits and updates the number of written bytes.
+*/
+
+static void bitWriterFlush(BitWriter *writer) {
+  if (writer->bitCount > 0) {
+    writer->buffer = (unsigned char)(writer->buffer << (8 - writer->bitCount));
+    fputc(writer->buffer, writer->file);
+    writer->buffer = 0;
+    writer->bitCount = 0;
+    writer->bytesWritten++;
+  }
+}
+
+/*
+Function that writes the compressed data of one file into the archive.
+Input:
+    - output: pointer to the destination binary file.
+    - file: pointer to the file entry that will be compressed and written.
+    - codes: array of pointers to the Huffman codes for each byte.
+Output:
+    - writes the compressed file data to the archive and verifies the written size.
+*/
+
+static void writeCompressedFileData(FILE *output, const FileEntry *file, char *codes[ALPHABET_SIZE]) {
+  unsigned char buffer[1024];
   FILE *input = fopen(file->fullPath, "rb");
-  MemoryBitWriter writer;
+  BitWriter writer;
   size_t bytesRead;
 
   if (input == NULL) {
@@ -431,32 +487,23 @@ static void compressFileToMemory(const FileEntry *file,
     exit(EXIT_FAILURE);
   }
 
-  memoryBitWriterInit(&writer);
+  bitWriterInit(&writer, output);
 
   while ((bytesRead = fread(buffer, 1, sizeof(buffer), input)) > 0) {
     size_t i;
     for (i = 0; i < bytesRead; i++) {
-      memoryBitWriterWriteCode(&writer, codes[buffer[i]]);
+      bitWriterWriteCode(&writer, codes[buffer[i]]);
     }
   }
 
-  memoryBitWriterFlush(&writer);
+  bitWriterFlush(&writer);
   fclose(input);
 
-  *compressedData = writer.data;
-  *compressedSize = (uint64_t)writer.size;
-}
-
-static void compressFilesSequential(FileList *list,
-                                    char *codes[ALPHABET_SIZE],
-                                    CompressedFile *results) {
-  size_t i;
-
-  for (i = 0; i < list->count; i++) {
-    results[i].data = NULL;
-    results[i].size = 0;
-    compressFileToMemory(&list->items[i], codes, &results[i].data, &results[i].size);
-    list->items[i].compressedSize = results[i].size;
+  if (writer.bytesWritten != file->compressedSize) {
+    fprintf(stderr,
+            "\033[41m\n----|ERROR: compressed size mismatch for '%s'.|----\033[0m\n\n",
+            file->relativePath);
+    exit(EXIT_FAILURE);
   }
 }
 
@@ -471,12 +518,11 @@ Output:
     - writes the complete compressed directory into one binary file.
 */
 
-static uint64_t writeArchive(const char *outputPath,
-                             FileList *list,
-                             const uint32_t freq[ALPHABET_SIZE],
-                             const CompressedFile *results) {
+static void writeArchive(const char *outputPath,
+                         const FileList *list,
+                         const uint32_t freq[ALPHABET_SIZE],
+                         char *codes[ALPHABET_SIZE]) {
   FILE *output = fopen(outputPath, "wb");
-  uint64_t totalCompressed = 0;
   size_t i;
 
   if (output == NULL) {
@@ -504,22 +550,21 @@ static uint64_t writeArchive(const char *outputPath,
     const FileEntry *file = &list->items[i];
     uint32_t pathLen = (uint32_t)strlen(file->relativePath);
 
-    totalCompressed += results[i].size;
-
     if (!writeU32(output, pathLen) ||
         fwrite(file->relativePath, 1, pathLen, output) != pathLen ||
         !writeU64(output, file->originalSize) ||
-        !writeU64(output, results[i].size) ||
-        (results[i].size > 0 &&
-         fwrite(results[i].data, 1, (size_t)results[i].size, output) != (size_t)results[i].size)) {
+        !writeU64(output, file->compressedSize)) {
       fclose(output);
-      fprintf(stderr, "\033[41m\n----|ERROR: couldn't write file metadata or data.|----\033[0m\n\n");
+      fprintf(stderr, "\033[41m\n----|ERROR: couldn't write file metadata.|----\033[0m\n\n");
       exit(EXIT_FAILURE);
+    }
+
+    if (file->compressedSize > 0) {
+      writeCompressedFileData(output, file, codes);
     }
   }
 
   fclose(output);
-  return totalCompressed;
 }
 
 /*
@@ -537,31 +582,6 @@ static void freeCodes(char *codes[ALPHABET_SIZE]) {
   }
 }
 
-static void freeCompressedFiles(CompressedFile *results, size_t count) {
-  size_t i;
-
-  for (i = 0; i < count; i++) {
-    free(results[i].data);
-  }
-
-  free(results);
-}
-
-static uint64_t currentTimeMs(void) {
-#ifdef _WIN32
-  LARGE_INTEGER frequency;
-  LARGE_INTEGER counter;
-
-  QueryPerformanceFrequency(&frequency);
-  QueryPerformanceCounter(&counter);
-  return (uint64_t)((counter.QuadPart * 1000ull) / frequency.QuadPart);
-#else
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000u);
-#endif
-}
-
 int main(int argc, char *argv[]) {
   FileList list;
   HeapNode *root;
@@ -570,10 +590,14 @@ int main(int argc, char *argv[]) {
   uint32_t freq[ALPHABET_SIZE];
   uint64_t totalOriginal = 0;
   uint64_t totalCompressed = 0;
-  uint64_t startMs;
-  uint64_t endMs;
-  CompressedFile *results;
   size_t i;
+  
+  // Time calculation variables
+  
+  struct timespec start, end;
+  long seconds = 0;
+  long nseconds = 0;
+  double time = 0.0;
 
   if (argc != 3) {
     fprintf(stderr,
@@ -582,7 +606,7 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  startMs = currentTimeMs();
+  clock_gettime(CLOCK_MONOTONIC, &start);
 
   initList(&list);
   collectFiles(argv[1], &list);
@@ -591,23 +615,27 @@ int main(int argc, char *argv[]) {
   root = buildHuffmanTree(freq);
   buildCodes(root, path, 0, codes);
 
+  addCompressedSizes(&list, codes);
+
   for (i = 0; i < list.count; i++) {
     totalOriginal += list.items[i].originalSize;
+    totalCompressed += list.items[i].compressedSize;
   }
 
-  results = (CompressedFile *)allocateMemory(list.count * sizeof(CompressedFile));
-  compressFilesSequential(&list, codes, results);
-  totalCompressed = writeArchive(argv[2], &list, freq, results);
-  endMs = currentTimeMs();
+  writeArchive(argv[2], &list, freq, codes);
+
+  clock_gettime(CLOCK_MONOTONIC, &end);
+  
+  seconds = end.tv_sec - start.tv_sec;
+  nseconds = end.tv_nsec - start.tv_nsec;
+  time = (seconds) * 1000L + (nseconds) / 1000000L;
 
   fprintf(stdout, "*** Directory %s compressed correctly ***\n", argv[1]);
   printf("| Files: %zu |\n", list.count);
   printf("| Original size: %llu bytes |\n", (unsigned long long)totalOriginal);
   printf("| Compressed size: %llu bytes |\n", (unsigned long long)totalCompressed);
-  printf("| Threads: 1 |\n");
-  printf("| Time elapsed: %llu ms |\n", (unsigned long long)(endMs - startMs));
+  printf("| Time elapsed: %.6f ms |\n", time);
 
-  freeCompressedFiles(results, list.count);
   freeCodes(codes);
   freeTree(root);
   freeList(&list);

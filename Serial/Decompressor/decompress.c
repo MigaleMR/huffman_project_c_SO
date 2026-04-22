@@ -2,33 +2,20 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <errno.h>
-
-#ifdef _WIN32
-#include <windows.h>
-#else
 #include <time.h>
-#endif
 
 #include "huffman.h"
 
 typedef struct {
-  const unsigned char *data;
-  uint64_t dataSize;
-  uint64_t byteIndex;
+  FILE *file;
   unsigned char buffer;
   unsigned char bitsLeft;
-} MemoryBitReader;
-
-typedef struct {
-  char *relativePath;
-  char *outputPath;
-  unsigned char *compressedData;
-  uint64_t originalSize;
-  uint64_t compressedSize;
-} ArchiveEntry;
+  uint64_t bytesRemaining;
+} BitReader;
 
 /*
 Function that allocates dynamic memory and verifies if the allocation was successful.
@@ -300,14 +287,11 @@ Output:
     - sets the initial state of the bit reader.
 */
 
-static void memoryBitReaderInit(MemoryBitReader *reader,
-                                const unsigned char *data,
-                                uint64_t dataSize) {
-  reader->data = data;
-  reader->dataSize = dataSize;
-  reader->byteIndex = 0;
+static void bitReaderInit(BitReader *reader, FILE *file, uint64_t byteCount) {
+  reader->file = file;
   reader->buffer = 0;
   reader->bitsLeft = 0;
+  reader->bytesRemaining = byteCount;
 }
 
 /*
@@ -318,18 +302,44 @@ Output:
     - returns the next bit read from the input stream, or -1 if no more bits are available.
 */
 
-static int memoryBitReaderReadBit(MemoryBitReader *reader) {
+static int bitReaderReadBit(BitReader *reader) {
   if (reader->bitsLeft == 0) {
-    if (reader->byteIndex >= reader->dataSize) {
+    int value;
+
+    if (reader->bytesRemaining == 0) {
       return -1;
     }
 
-    reader->buffer = reader->data[reader->byteIndex++];
+    value = fgetc(reader->file);
+    if (value == EOF) {
+      return -1;
+    }
+
+    reader->buffer = (unsigned char)value;
     reader->bitsLeft = 8;
+    reader->bytesRemaining--;
   }
 
   reader->bitsLeft--;
   return (reader->buffer >> reader->bitsLeft) & 1;
+}
+
+/*
+Function that consumes any remaining unread bytes of the current compressed block.
+Input:
+    - reader: pointer to the bit reader structure.
+Output:
+    - discards the remaining bytes of the current block and resets the pending bit count.
+*/
+
+static void bitReaderConsumeRemaining(BitReader *reader) {
+  while (reader->bytesRemaining > 0) {
+    if (fgetc(reader->file) == EOF) {
+      break;
+    }
+    reader->bytesRemaining--;
+  }
+  reader->bitsLeft = 0;
 }
 
 /*
@@ -345,26 +355,28 @@ Output:
     - writes the decompressed file contents to the output file.
 */
 
-static void decompressBlock(FILE *output,
+static void decompressBlock(FILE *input,
+                            FILE *output,
                             const HeapNode *root,
                             uint64_t originalSize,
                             uint64_t compressedSize,
-                            const unsigned char *compressedData,
                             const char *relativePath) {
-  MemoryBitReader reader;
+  BitReader reader;
   uint64_t written = 0;
 
   if (originalSize == 0) {
+    bitReaderInit(&reader, input, compressedSize);
+    bitReaderConsumeRemaining(&reader);
     return;
   }
 
-  memoryBitReaderInit(&reader, compressedData, compressedSize);
+  bitReaderInit(&reader, input, compressedSize);
 
   while (written < originalSize) {
     const HeapNode *current = root;
 
     while (!huffmanIsLeaf(current)) {
-      int bit = memoryBitReaderReadBit(&reader);
+      int bit = bitReaderReadBit(&reader);
       if (bit < 0) {
         fprintf(stderr,
                 "\033[41m\n----|ERROR: unexpected end of compressed block '%s'.|----\033[0m\n\n",
@@ -384,113 +396,24 @@ static void decompressBlock(FILE *output,
     fputc(huffmanGetCharacter(current), output);
     written++;
   }
-}
 
-static ArchiveEntry *readArchiveEntries(FILE *input, uint32_t fileCount, const char *outputDir) {
-  ArchiveEntry *entries = (ArchiveEntry *)allocateMemory((size_t)fileCount * sizeof(ArchiveEntry));
-  uint32_t i;
-
-  for (i = 0; i < fileCount; i++) {
-    uint32_t pathLen = readU32(input);
-    entries[i].relativePath = (char *)allocateMemory((size_t)pathLen + 1);
-    entries[i].compressedData = NULL;
-
-    readExact(input, entries[i].relativePath, pathLen, "file path");
-    entries[i].relativePath[pathLen] = '\0';
-
-    if (isUnsafeRelativePath(entries[i].relativePath)) {
-      fprintf(stderr,
-              "\033[41m\n----|ERROR: invalid relative route: '%s'|----\033[0m\n\n",
-              entries[i].relativePath);
-      exit(EXIT_FAILURE);
-    }
-
-    entries[i].originalSize = readU64(input);
-    entries[i].compressedSize = readU64(input);
-
-    if (entries[i].compressedSize > 0) {
-      if (entries[i].compressedSize > (uint64_t)SIZE_MAX) {
-        fprintf(stderr, "\033[41m\n----|ERROR: compressed block too large.|----\033[0m\n\n");
-        exit(EXIT_FAILURE);
-      }
-
-      entries[i].compressedData = (unsigned char *)allocateMemory((size_t)entries[i].compressedSize);
-      readExact(input,
-                entries[i].compressedData,
-                (size_t)entries[i].compressedSize,
-                "compressed block");
-    }
-
-    entries[i].outputPath = joinPaths(outputDir, entries[i].relativePath);
-  }
-
-  return entries;
-}
-
-static void decompressEntriesSequential(ArchiveEntry *entries,
-                                        uint32_t fileCount,
-                                        const HeapNode *root) {
-  uint32_t i;
-
-  for (i = 0; i < fileCount; i++) {
-    FILE *output;
-
-    ensureParentDirectories(entries[i].outputPath);
-    output = fopen(entries[i].outputPath, "wb");
-    if (output == NULL) {
-      fprintf(stderr,
-              "\033[41m\n----|ERROR: couldn't create '%s'.|----\033[0m\n\n",
-              entries[i].outputPath);
-      exit(EXIT_FAILURE);
-    }
-
-    decompressBlock(output,
-                    root,
-                    entries[i].originalSize,
-                    entries[i].compressedSize,
-                    entries[i].compressedData,
-                    entries[i].relativePath);
-    fclose(output);
-  }
-}
-
-static void freeArchiveEntries(ArchiveEntry *entries, uint32_t fileCount) {
-  uint32_t i;
-
-  for (i = 0; i < fileCount; i++) {
-    free(entries[i].relativePath);
-    free(entries[i].outputPath);
-    free(entries[i].compressedData);
-  }
-
-  free(entries);
-}
-
-static uint64_t currentTimeMs(void) {
-#ifdef _WIN32
-  LARGE_INTEGER frequency;
-  LARGE_INTEGER counter;
-
-  QueryPerformanceFrequency(&frequency);
-  QueryPerformanceCounter(&counter);
-  return (uint64_t)((counter.QuadPart * 1000ull) / frequency.QuadPart);
-#else
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000u);
-#endif
+  bitReaderConsumeRemaining(&reader);
 }
 
 int main(int argc, char *argv[]) {
   FILE *input;
   HeapNode *root;
   char *outputDir;
-  ArchiveEntry *entries;
   uint32_t fileCount;
   uint32_t freq[ALPHABET_SIZE];
-  uint64_t startMs;
-  uint64_t endMs;
   uint32_t i;
+  
+  // Time calculation variables
+  
+  struct timespec start, end;
+  long seconds = 0;
+  long nseconds = 0;
+  double time = 0.0;
 
   if (argc != 2) {
     fprintf(stderr,
@@ -507,7 +430,7 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  startMs = currentTimeMs();
+  clock_gettime(CLOCK_MONOTONIC, &start);
 
   fileCount = readU32(input);
   for (i = 0; i < ALPHABET_SIZE; i++) {
@@ -518,20 +441,67 @@ int main(int argc, char *argv[]) {
 
   outputDir = makeOutputDirectoryFromBin(argv[1]);
   ensureDirectoryTree(outputDir);
-  entries = readArchiveEntries(input, fileCount, outputDir);
-  decompressEntriesSequential(entries, fileCount, root);
 
-  endMs = currentTimeMs();
+  for (i = 0; i < fileCount; i++) {
+    uint32_t pathLen = readU32(input);
+    char *relativePath = (char *)allocateMemory((size_t)pathLen + 1);
+    char *outputPath;
+    uint64_t originalSize;
+    uint64_t compressedSize;
+    FILE *output;
 
-  freeArchiveEntries(entries, fileCount);
+    readExact(input, relativePath, pathLen, "file path");
+    relativePath[pathLen] = '\0';
+
+    if (isUnsafeRelativePath(relativePath)) {
+      fprintf(stderr,
+              "\033[41m\n----|ERROR: invalid relative route: '%s'|----\033[0m\n\n",
+              relativePath);
+      free(relativePath);
+      free(outputDir);
+      freeTree(root);
+      fclose(input);
+      return EXIT_FAILURE;
+    }
+
+    originalSize = readU64(input);
+    compressedSize = readU64(input);
+
+    outputPath = joinPaths(outputDir, relativePath);
+    ensureParentDirectories(outputPath);
+
+    output = fopen(outputPath, "wb");
+    if (output == NULL) {
+      fprintf(stderr,
+              "\033[41m\n----|ERROR: couldn't create '%s'.|----\033[0m\n\n",
+              outputPath);
+      free(outputPath);
+      free(relativePath);
+      free(outputDir);
+      freeTree(root);
+      fclose(input);
+      return EXIT_FAILURE;
+    }
+
+    decompressBlock(input, output, root, originalSize, compressedSize, relativePath);
+    fclose(output);
+
+    free(outputPath);
+    free(relativePath);
+  }
+
+  clock_gettime(CLOCK_MONOTONIC, &end);
+  
+  seconds = end.tv_sec - start.tv_sec;
+  nseconds = end.tv_nsec - start.tv_nsec;
+  time = (seconds) * 1000L + (nseconds) / 1000000L;
+
   free(outputDir);
   freeTree(root);
   fclose(input);
 
   fprintf(stdout, "*** File %s decompressed correctly ***\n", argv[1]);
-  printf("| Files: %u |\n", fileCount);
-  printf("| Threads: 1 |\n");
-  printf("| Time elapsed: %llu ms |\n", (unsigned long long)(endMs - startMs));
+  printf("| Time elapsed: %.6f ms |\n", time);
 
   return EXIT_SUCCESS;
 }
