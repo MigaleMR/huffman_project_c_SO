@@ -91,8 +91,8 @@ build_all() {
   build_target "Serial/Decompressor"
   build_target "Concurrent/Compressor"
   build_target "Concurrent/Decompressor"
-  build_target "Parallel/Compress"
-  build_target "Parallel/Decompress"
+  build_target "Parallel/Compressor"
+  build_target "Parallel/Decompressor"
 }
 
 clean_all() {
@@ -100,8 +100,8 @@ clean_all() {
   clean_target "Serial/Decompressor"
   clean_target "Concurrent/Compressor"
   clean_target "Concurrent/Decompressor"
-  clean_target "Parallel/Compress"
-  clean_target "Parallel/Decompress"
+  clean_target "Parallel/Compressor"
+  clean_target "Parallel/Decompressor"
 }
 
 verify_all() {
@@ -109,8 +109,8 @@ verify_all() {
   verify_binary "Serial/Decompressor/decompress"
   verify_binary "Concurrent/Compressor/compress_pthread"
   verify_binary "Concurrent/Decompressor/decompress_pthread"
-  verify_binary "Parallel/Compress/compress_parallel"
-  verify_binary "Parallel/Decompress/decompress_parallel"
+  verify_binary "Parallel/Compressor/compress_parallel"
+  verify_binary "Parallel/Decompressor/decompress_parallel"
 }
 
 print_usage() {
@@ -163,13 +163,13 @@ main() {
     if [[ "${MODE}" == "auto" ]]; then
       printf 'Se ejecuto limpieza y recompilacion completa automaticamente.\n'
     fi
-    printf 'Ejecutables generados:\n'
-    printf '  - Serial/Compressor/compress\n'
-    printf '  - Serial/Decompressor/decompress\n'
-    printf '  - Concurrent/Compressor/compress_pthread\n'
-    printf '  - Concurrent/Decompressor/decompress_pthread\n'
-    printf '  - Parallel/Compress/compress_parallel\n'
-    printf '  - Parallel/Decompress/decompress_parallel\n'
+      printf 'Ejecutables generados:\n'
+      printf '  - Serial/Compressor/compress\n'
+      printf '  - Serial/Decompressor/decompress\n'
+      printf '  - Concurrent/Compressor/compress_pthread\n'
+      printf '  - Concurrent/Decompressor/decompress_pthread\n'
+      printf '  - Parallel/Compressor/compress_parallel\n'
+      printf '  - Parallel/Decompressor/decompress_parallel\n'
   fi
 }
 
