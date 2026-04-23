@@ -206,15 +206,19 @@ static void decompressBlock(FILE               *output,
   while (written < originalSize) {
     const HeapNode *node = root;
     int bit;
-    while (node->left != NULL) {
+    while (!huffmanIsLeaf(node)) {
       bit = memoryBitReaderReadBit(&reader);
       if (bit < 0) {
         fprintf(stderr, "\033[41m\n----|ERROR: datos comprimidos incompletos en '%s'.|----\033[0m\n\n", relativePath);
         exit(EXIT_FAILURE);
       }
-      node = (bit == 0) ? node->left : node->right;
+      node = (bit == 0) ? huffmanGetLeft(node) : huffmanGetRight(node);
+      if (node == NULL) {
+        fprintf(stderr, "\033[41m\n----|ERROR: flujo de bits invalido en '%s'.|----\033[0m\n\n", relativePath);
+        exit(EXIT_FAILURE);
+      }
     }
-    fputc((unsigned char)node->symbol, output);
+    fputc((unsigned char)huffmanGetCharacter(node), output);
     written++;
   }
 }
