@@ -2,10 +2,9 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-APT_CMD=()
-MODE="${1:-auto}"
+scriptDir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+mode="${1:-auto}"
+aptCmd=()
 
 info() {
   printf '[INFO] %s\n' "$1"
@@ -15,39 +14,39 @@ error() {
   printf '[ERROR] %s\n' "$1" >&2
 }
 
-require_linux_debian() {
+requireLinuxDebian() {
   if [[ "$(uname -s)" != "Linux" ]]; then
-    error "Este script esta pensado para Linux."
+    error "Este script está pensado para Linux."
     exit 1
   fi
 
   if [[ ! -f /etc/os-release ]]; then
-    error "No se pudo detectar la distribucion."
+    error "No se pudo detectar la distribución."
     exit 1
   fi
 
   # shellcheck disable=SC1091
   source /etc/os-release
 
-  if [[ "${ID:-}" != "debian" ]] && [[ "${ID_LIKE:-}" != *"debian"* ]]; then
-    error "Este setup.sh esta hecho para Debian o derivadas compatibles con apt."
+  if [[ "${ID:-}" != "debian" && "${ID_LIKE:-}" != *"debian"* ]]; then
+    error "Este setup.sh está hecho para Debian o derivadas compatibles con apt."
     exit 1
   fi
 
   if ! command -v apt-get >/dev/null 2>&1; then
-    error "No se encontro apt-get en el sistema."
+    error "No se encontró apt-get en el sistema."
     exit 1
   fi
 }
 
-configure_apt_command() {
+configureAptCommand() {
   if [[ "$(id -u)" -eq 0 ]]; then
-    APT_CMD=(apt-get)
+    aptCmd=(apt-get)
     return
   fi
 
   if command -v sudo >/dev/null 2>&1; then
-    APT_CMD=(sudo apt-get)
+    aptCmd=(sudo apt-get)
     return
   fi
 
@@ -55,121 +54,140 @@ configure_apt_command() {
   exit 1
 }
 
-install_dependencies() {
-  info "Actualizando indices de paquetes..."
-  "${APT_CMD[@]}" update
+installDependencies() {
+  info "Actualizando índices de paquetes..."
+  "${aptCmd[@]}" update
 
-  info "Instalando dependencias de compilacion..."
-  "${APT_CMD[@]}" install -y build-essential
+  info "Instalando dependencias de compilación..."
+  "${aptCmd[@]}" install -y build-essential
 }
 
-build_target() {
-  local relative_dir="$1"
+checkMakefile() {
+  local relativeDir="$1"
 
-  info "Compilando ${relative_dir}..."
-  make -C "${SCRIPT_DIR}/${relative_dir}"
-}
-
-clean_target() {
-  local relative_dir="$1"
-
-  info "Limpiando ${relative_dir}..."
-  make -C "${SCRIPT_DIR}/${relative_dir}" clean
-}
-
-verify_binary() {
-  local binary_path="$1"
-
-  if [[ ! -x "${SCRIPT_DIR}/${binary_path}" ]]; then
-    error "No se encontro el ejecutable esperado: ${binary_path}"
+  if [[ ! -f "${scriptDir}/${relativeDir}/Makefile" && ! -f "${scriptDir}/${relativeDir}/makefile" ]]; then
+    error "No se encontró Makefile en: ${relativeDir}"
     exit 1
   fi
 }
 
-build_all() {
-  build_target "Serial/Compressor"
-  build_target "Serial/Decompressor"
-  build_target "Concurrent/Compressor"
-  build_target "Concurrent/Decompressor"
-  build_target "Parallel/Compressor"
-  build_target "Parallel/Decompressor"
+buildTarget() {
+  local relativeDir="$1"
+
+  checkMakefile "${relativeDir}"
+
+  info "Compilando ${relativeDir}..."
+  make -C "${scriptDir}/${relativeDir}"
 }
 
-clean_all() {
-  clean_target "Serial/Compressor"
-  clean_target "Serial/Decompressor"
-  clean_target "Concurrent/Compressor"
-  clean_target "Concurrent/Decompressor"
-  clean_target "Parallel/Compressor"
-  clean_target "Parallel/Decompressor"
+cleanTarget() {
+  local relativeDir="$1"
+
+  checkMakefile "${relativeDir}"
+
+  info "Limpiando ${relativeDir}..."
+  make -C "${scriptDir}/${relativeDir}" clean
 }
 
-verify_all() {
-  verify_binary "Serial/Compressor/compress"
-  verify_binary "Serial/Decompressor/decompress"
-  verify_binary "Concurrent/Compressor/compress_pthread"
-  verify_binary "Concurrent/Decompressor/decompress_pthread"
-  verify_binary "Parallel/Compressor/compress_parallel"
-  verify_binary "Parallel/Decompressor/decompress_parallel"
+verifyBinary() {
+  local binaryPath="$1"
+
+  if [[ ! -x "${scriptDir}/${binaryPath}" ]]; then
+    error "No se encontró el ejecutable esperado: ${binaryPath}"
+    exit 1
+  fi
 }
 
-print_usage() {
+buildAll() {
+  buildTarget "Serial/Compressor"
+  buildTarget "Serial/Decompressor"
+  buildTarget "Concurrent/Compressor"
+  buildTarget "Concurrent/Decompressor"
+  buildTarget "Parallel/Compressor"
+  buildTarget "Parallel/Decompressor"
+}
+
+cleanAll() {
+  cleanTarget "Serial/Compressor"
+  cleanTarget "Serial/Decompressor"
+  cleanTarget "Concurrent/Compressor"
+  cleanTarget "Concurrent/Decompressor"
+  cleanTarget "Parallel/Compressor"
+  cleanTarget "Parallel/Decompressor"
+}
+
+verifyAll() {
+  verifyBinary "Serial/Compressor/compress"
+  verifyBinary "Serial/Decompressor/decompress"
+  verifyBinary "Concurrent/Compressor/compress_pthread"
+  verifyBinary "Concurrent/Decompressor/decompress_pthread"
+  verifyBinary "Parallel/Compressor/compress_parallel"
+  verifyBinary "Parallel/Decompressor/decompress_parallel"
+}
+
+printUsage() {
   printf 'Uso: %s [auto|build|clean|rebuild|help]\n' "$(basename "$0")"
 }
 
-main() {
-  require_linux_debian
+printGeneratedExecutables() {
+  printf 'Ejecutables generados:\n'
+  printf '  - Serial/Compressor/compress\n'
+  printf '  - Serial/Decompressor/decompress\n'
+  printf '  - Concurrent/Compressor/compress_pthread\n'
+  printf '  - Concurrent/Decompressor/decompress_pthread\n'
+  printf '  - Parallel/Compressor/compress_parallel\n'
+  printf '  - Parallel/Decompressor/decompress_parallel\n'
+}
 
-  case "${MODE}" in
+main() {
+  requireLinuxDebian
+
+  case "${mode}" in
     auto)
-      configure_apt_command
-      install_dependencies
-      clean_all
-      build_all
-      verify_all
+      configureAptCommand
+      installDependencies
+      cleanAll
+      buildAll
+      verifyAll
       ;;
     build)
-      configure_apt_command
-      install_dependencies
-      build_all
-      verify_all
+      configureAptCommand
+      installDependencies
+      buildAll
+      verifyAll
       ;;
     clean)
-      clean_all
+      cleanAll
       ;;
     rebuild)
-      configure_apt_command
-      install_dependencies
-      clean_all
-      build_all
-      verify_all
+      configureAptCommand
+      installDependencies
+      cleanAll
+      buildAll
+      verifyAll
       ;;
     help|-h|--help)
-      print_usage
+      printUsage
       exit 0
       ;;
     *)
-      error "Modo invalido: ${MODE}"
-      print_usage
+      error "Modo inválido: ${mode}"
+      printUsage
       exit 1
       ;;
   esac
 
   info "Proyecto listo."
   printf '\n'
-  if [[ "${MODE}" == "clean" ]]; then
+
+  if [[ "${mode}" == "clean" ]]; then
     printf 'Se limpiaron los binarios generados por los makefiles.\n'
   else
-    if [[ "${MODE}" == "auto" ]]; then
-      printf 'Se ejecuto limpieza y recompilacion completa automaticamente.\n'
+    if [[ "${mode}" == "auto" ]]; then
+      printf 'Se ejecutó limpieza y recompilación completa automáticamente.\n'
     fi
-      printf 'Ejecutables generados:\n'
-      printf '  - Serial/Compressor/compress\n'
-      printf '  - Serial/Decompressor/decompress\n'
-      printf '  - Concurrent/Compressor/compress_pthread\n'
-      printf '  - Concurrent/Decompressor/decompress_pthread\n'
-      printf '  - Parallel/Compressor/compress_parallel\n'
-      printf '  - Parallel/Decompressor/decompress_parallel\n'
+
+    printGeneratedExecutables
   fi
 }
 
